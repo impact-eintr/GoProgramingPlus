@@ -33,10 +33,8 @@ func (pa *A) SetName() string {
 }
 
 func main() {
-
 	a := A{name: "eintr"}
-	pa := &a
 
-	fmt.Println(a.SetName(), a.name)
-	fmt.Println(pa.GetName(), a.name)
+	f1 := A.GetName
+	f1(a)
 }

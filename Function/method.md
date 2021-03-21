@@ -89,3 +89,37 @@ func main() {
 	fmt.Println(pa.GetName(), a.name)
 }
 ~~~
+
+## 将方法复制给变量
+
+~~~ go
+
+type A struct {
+	name string
+}
+func (a A) GetName() string {
+	return a.name
+}
+
+func main() {
+	a := A{name: "eintr"}
+
+	f1 := A.GetName//方法表达式
+	f1(a)
+}
+~~~
+
+相当于
+~~~ go
+func GetName(a A) string {
+	return a.name
+}
+
+func main() {
+	a := A{name: "eintr"}
+
+	f1 := GetName
+	f1(a)
+}
+
+~~~
