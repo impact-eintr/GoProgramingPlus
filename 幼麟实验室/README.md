@@ -621,11 +621,781 @@ func main() {
 
 ```
 
+编译后 会变成下面的代码(伪代码)
+
+``` go
+func A_defer() {
+	r = deferproc(8, B) // 注册
+	if r > 0 {
+		goto ret
+	}
+
+	runtime.deferreturn() // 执行
+	return
+
+ret:
+	runtime.deferreturn()
+}
+
+```
+
+defer信息会注册到一个链表，而当前执行的goroutine持有这个链表的头指针，每个goroutine在运行时都有一个对应的结构体`g`
+
+``` go
+type runtime.g struct {
+	_defer *_defer* // 指向defer链表的头部
+	// _defer -> _new_defer-_defer-_defer-_defer 注意执行时是从头开始 所以先注册的后调用
+}
+```
+
+``` go
+func main() {
+	A()
+}
+
+func A() {
+	a, b := 1, 2
+	defer A1(a) // defer函数的参数注册时拷贝到堆上 执行时又拷贝到栈上
+
+	a = a + b
+	fmt.Println(a, b)
+}
+
+func A1(a int) {
+	fmt.Println(a)
+}
+
+```
+
+
+``` go
+func deferproc(size int32, fn *fancval) // A1 的参数加返回值共占多大空间 第二个fancval因为没有捕获列表 优化到只读代码段 分配一个共用的funcval结构体 所以这里是A1的地址
+```
+
+``` go
+
+type _defer struct {
+	siz     int32    // defer函数参数和返回值共占多少字节 这段空间会直接分配在_defer结构体后面 用于在注册时保存参数 并在执行时拷贝到调用者参数与返回值空间
+	started bool     // defer函数是否已经执行
+	sp      uintptr  // 注册这个defer的函数栈指针 通过他函数可以判断注册的defer是否已经执行完了
+	pc      uintptr  // deferproc的返回地址
+	fn      *funcval // 注册的函数
+	_panic  *_panic
+	link    *_defer // 前一个注册的defer结构体
+}
+
+```
+
+deferproc函数调用时，编译器会在它自己的两个参数后面，开辟一段空间，用来存放defer函数的返回值和参数，这一段空间会被直接拷贝到`_defer` 结构体的后面
+
+一个`_defer` 的内存结构
+``` go
+// 以下内容是堆上分配的内存
+siz = 8
+started = false
+sp of A
+return addr
+fn = addr2
+_panic = nil
+link = nil
+a = 1 // 8 byte
+```
+
+注册结束后，这个_defer结构体会被放到defer链表的头部
+
+实际上Golang会预先分配不同规格的defer池，执行时从空闲_defer中取一个出来用，没有空闲的或者没有大小合适的再进行堆分配，用完后再放到空闲defer池，这样可以避免频繁地堆分配与回收
+
+``` go
+func main() {
+	A()
+}
+
+func A() {
+	a, b := 1, 2
+	defer func(b int) {
+		a = a + b // 因为a 的值被修改了 所以发生了变量逃逸 栈上存一个&a 使用堆上分配的a a -> 1 -> 3 -> 5
+		fmt.Println(a, b)
+	}(b)
+
+	a = a + b // *(&a)+=b
+	fmt.Println(a, b)
+}
+
+```
+
+这里最关键的是，分清defer传参和闭包捕获变量的实现机制
+![](./闭包与defer传参.png)
+
+``` go
+func main() {
+	a := 1
+	defer A(B(a)) // 注册时传入2
+	a++
+	fmt.Println(a)
+}
+
+func A(a int) {
+	a++
+	fmt.Println(a) // 执行时输出3
+}
+
+func B(a int) int {
+	k++
+	return a
+}
+
+```
+
+我们再来看一下defer链表的变化情况
+
+``` go
+func main() {
+	A()
+}
+
+func A() {
+	defer A1()
+	defer A2()
+	fmt.Println("A end")
+}
+
+func A1() {
+	fmt.Println("A1 end")
+}
+
+func A2() {
+	defer B1()
+	defer B2()
+	fmt.Println("A2 end")
+}
+
+func B1() {
+	fmt.Println("B2 end")
+}
+
+func B2() {
+	fmt.Println("B2 end")
+}
+
+```
+到A返回前执行deferreturn时，会判断链表头上的defer是不是A注册的，方法就是判断defer结构体记录的sp，是不是等于A的栈指针，保存函数调用的相关信息后，将A1移除，执行A2，又注册两个defer函数 B2 -> B1, A2返回前同样去执行defer链表，同样判断是否是自己注册的defer函数，然后B2、B1执行，此时A2仍然不知道自己注册的defer已经执行完了，直到下个_defer.sp不等于自己的栈指针，然后A2结束，回到A，执行A1，A1结束后A执行结束
+
+> 以上是go1.12的defer设计 最大的问题就是慢
+- _defer 堆分配
+- 链表操作慢
+#### defer的优化
+
+``` go
+func A() {
+	defer B(10)
+	
+}
+
+func B(i int) {
+
+}
+
+// Go 1.12
+func A() {
+	r := runtime.deferproc(0, B, 10)
+	if r > 0 {
+		goto ret
+	}
+	runtime.deferreturn()
+	return
+ret:
+	runtime.deferreturn()
+}
+
+// Go 1.13 减少了堆分配
+func A() {
+	// 通过在编译阶段 增加这样的局部变量 吧defer信息保存在当前函数栈帧的局部变量区域
+	var d struct {
+		runtime._defer
+		i int_
+	}
+	d.siz = 0
+	d.fn = B
+	d.i = 10
+	
+	r := runtime.deferprocStack(&d._defer) // 通过deferprocStack 把栈上的这个_defer结构体 注册到defer链表中
+	if r > 0 {
+		goto ret
+	}
+	runtime.deferreturn()
+	return
+ret:
+	runtime.deferreturn()
+}
+```
+
+
+``` go
+type _defer struct {
+	siz     int32    // defer函数参数和返回值共占多少字节 这段空间会直接分配在_defer结构体后面 用于在注册时保存参数 并在执行时拷贝到调用者参数与返回值空间
+	started bool     // defer函数是否已经执行
+	heap    bool     // 是否存储在堆上 
+	sp      uintptr  // 注册这个defer的函数栈指针 通过他函数可以判断注册的defer是否已经执行完了
+	pc      uintptr  // deferproc的返回地址
+	fn      *funcval // 注册的函数
+	_panic  *_panic
+	link    *_defer // 前一个注册的defer结构体
+}
+```
+
+> 以下情况仍然会堆分配
+``` go
+for i := 0;i < n;i++ {
+	defer B(i)
+}
+
+again:
+	defer B()
+	if i < n {
+		n++
+		goto again
+	}
+```
+
+``` go
+// 以下内容是堆上分配的内存
+siz = 8
+started = false
+heap = false
+sp of A
+return addr
+fn = addr2
+_panic = nil
+link = nil
+a = 1 // 8 byte
+```
+
+这个版本同样要在defer函数执行时拷贝参数，不过不是在堆栈间，而是从栈上的局部变量空间拷贝到参数空间
+
+> go1.14 
+``` go
+func A(int) {
+	var df byte // df是一个位图 对应每一个defer是否要被执行
+	var a, b = i, 2 * i
+	var m, n string = "hello", "eintr"
+	
+	df |= 1 // 把最低位置为1
+	if i > 1 {
+		df |= 2
+	}
+	// 如果这里发生了panic或者runtime.Goexit 下面的内容需要使用额外的栈扫描来发现
+	
+	if df & 2 > 0 {
+		df = df&^2
+		A2(m, n)
+	}
+	
+	if df & 1 > 0 {
+		df = df&^1 // df的最低为置0 避免重复执行
+		A1(a, b)
+	}
+}
+```
+
 # panic和recover
+## panic
+我们已经知道当前执行的goriutine中
+
+``` go
+type runtime.g struct {
+	...
+	_defer *_defer
+	_panic *_panic
+	...
+}
+```
+
+和defer一样，panic也有一个链表保存注册的panic，也是在链表头上插入新的_panic结构体，所以链表头上的panic就是当前正在执行的那一个
+
+``` go
+func A1() 
+	panic("panicA1") // 将这个panic作为panic链表头节点
+}
+
+func A() {
+	defer A1()
+	defer A2()
+	// do something
+	panic("panicA") // 进入panic处理逻辑 首先在panic链表中增加一项，然后执行defer链表
+	// 下面的代码不再执行
+	// do something
+}
+```
+
+在执行panic引发的defer时，会先把defer的`started`置为true， 标记它已经来是执行，并且会把`_panic`字段指向当前执行的panic，表示这个defer是由这个panic触发的
+如果当前defer函数可以正常执行，这一项就会被移除,继续执行下一个defer，之所以这样设计，是为了应对defer函数没有正常结束的情况
+执行最新的panic时，发现当前的defer链表头节点A1已经执行，并且出发她执行的并不是当前的panicA1，所以要根据这里记录的panic指针，找到对应的panic，**并把它标记为终止**
+
+``` go
+type _panic struct {
+argp      unsafe.Pointer // 当前要执行的defer的函数参数地址
+arg       interface{}    // panic自己的参数
+link      *_panic        // 前一个发生的panic 用于输出信息
+recovered bool           // panic是否被恢复
+aborted   bool           // panic是否被终止
+}
+```
+
+panicA被终止了 defer中的A1也要被移除，现在defer链表为空，之后就是打印panic信息，注意是从链表尾开始
+
+#### 小结
+- panic执行defer函数的方法 先标记后释放 目的是为了终止之前发生的panic
+- panic输出异常信息的方式 所有还在panic链表上的项都会被输出
+
+## recover
+recover函数本身的逻辑很简单，将当前执行的panic置为已经恢复,也就是把它的recovered字段置为true，其他的都不管
+
+``` go
+func main() {
+	A()
+}
+
+// runtime.g_
+             \_defer_ -> A2 -> A1
+             \_panic_ panicA
+func A() {
+	defer A1()
+	defer A2()
+	panic("panicA")
+}
+
+func A1() {
+	fmt.Println("A1 end")
+}
+
+// runtime.g_            执行后移除 移除前要保存_defer.sp 和 _defer.pc
+             \_defer_ ->  A1 -> A2
+             \_panic_ panicA.recovered = true // 已恢复
+func A2() {
+	p := recover()
+	fmt.Println(p)
+}
+
+```
+
+其实在每个defer执行完以后 panic处理流程都会检查当前panic是否已经被它恢复了 此时返现panicA已经被恢复，和就把它从链表中移除，A2也会被defer中移除, 移除前要保存_defer.sp 和 _defer.pc，接下来要做的就是利用保存的sp和pc，跳出panicA的处理流程
 
 # 类型系统
 
+``` go
+func main() {
+	t := T{"eintr"}
+	t.F1()
+	T.F1(t)
+}
+
+type T struct {
+	name string
+}
+
+func (t T) F1() {
+	fmt.Println(t.name)
+}
+```
+
+自定义一个结构体T，并且给他关联一个方法F1，方法本质上就是函数，只不过调用时，接收者会作为第一个参数传入
+
+``` go
+// built-in 内置类型
+int8
+int16
+int32
+int64
+int
+byte
+string
+slice
+func
+map
+
+// 自定义
+type T int
+type T struct {
+	name string
+}
+type I interface {
+	Name() string
+}
+```
+给内置的方法定义方法是不被允许的, 而接口是无效的方法接收者，所以不能给内置类型和接口定义
+
+不管是内置类型还是自定义类型，都有对应的类型描述信息，称为它的`类型元数据`，而且每种数据类型的元数据都是全局唯一的,，这些类型元数据共同构成了Go语言的`类型系统`
+
+``` go
+// runtime._type
+type _type struct {
+	size       uintptr
+	ptrdata    uintptr
+	hash       uint32
+	tflag      tflag
+	align      uint8
+	fieldalign uint8
+	kind       uint8
+	...
+}
+```
+在_type之后存储的是各种的类型额外描述的信息，例如slice的类型元数据在_type结构体后面，记录着一个*_type，指向其存储的元素的类型元数据，如果是string类型的slice，这个指针就指向string类型的元数据
+如果是自定义的数据类型，这后面还会有一个`uncommontype`结构体
+
+``` go
+type uncommontype struct {
+	pkgpath nameOff // 包路径
+	mconut  uint16  // 方法数目
+	_       uint16  	
+	moff    uint32  // 方法元数据组成的数组相对于这个uncommonttype结构体的偏移值
+	_       uint32_
+}
+```
+
+``` go
+type method struct {
+	name nameOff
+	mtyp typeOff
+	ifn  textOff
+	tfn  textOff
+}
+```
+
+``` go
+type myslice []string
+
+func (ms myslice) Len() {
+	fmt.Println(len(ms))
+}
+
+func (ms myslice) Cap() {
+	fmt.Println(cap(ms))
+}
+
+```
+
+``` go
+// myslice类型元数据
+|    slicetype   |
+|   uncommontype | -> moff
+|        ...     | + moff
+|    method[0]   | Cap
+|    method[1]   | Len
+```
+
+``` go
+type MyType1 = int32 // 类型别名
+
+type Mytype2 int32   // 自定义类型
+```
+
+MyType1 和 int32会关联到同一个类型元数据，属于同一种类型，`rune`和`int32`就是这种关系
+MyType2 和 int32 是完全不同的两种类型，因为它们对应的类型元数据是不同的
+
+# 接口
+
+## 空接口
+``` go
+interface{}
+
+// runtime.eface
+
+_type *_type
+data unsafe.Pointer
+
+```
+先看看空接口长什么样子，interface{}可以接受任意类型的数据，他只要记录这个数据在哪儿，是什么类型的就足够了，这个`_type`就指向接口的动态类型元数据，data指向接口的动态值
+
+![](./空接口与类型信息.png )
+
+
+## 非空接口
+非空接口就是有方法列表的接口类型，一个变量要想赋值给一个非空接口类型，必须要实现该接口要求的所有方法才行
+
+``` go
+type iface struct {
+	tab *itab
+	data unsafe.Pointer* // 动态值
+}
+```
+
+``` go
+type itab struct {
+	inter *interfacetype // 见下
+	_type *_type         // 接口的动态类型元数据
+	hash  uint32         // 从动态类型元数据中拷贝过来的类型hash值 可以快速判断类型是否相等时使用
+	_     [4]byte
+	fun   [1]uintptr_    // 当前动态类型实现的那些接口要求的方法地址
+}
+```
+
+``` go
+type interfacetype struct {
+	typ     _type
+	pkgpath name_
+	mhdr    []inmethod
+}
+```
+
+``` go
+var rw io.ReadWriter
+
+func main() {
+	f, _ := os.Open("./main.go")
+	rw = f
+	a := make([]byte, 1024)
+	rw.Read(a)
+	fmt.Println(string(a))
+}
+
+```
+
+
+``` go
+rw.data = f
+rw.tab.inter = io.ReadWrite-> tye|pkgpath|mhdr[0](Read)|mhdr[1](Write)
+rw._type = *os.File的类型元数据
+rw.hash = os.File hash
+rw.fun = fun[0]|fun[1] 拷贝自方法元数据(uncommonttype+moff找到的类型方法地址)
+```
+
+![](./非空接口的结构.png )
+
+另外，我们知道一旦接口类型确定了，动态数据类型也确定了，那么itab的内容就不会改变了，那么这个itab结构体就是可复用的，实际上go会把用到的itasb结构体缓存起来，并且以接口类型和动态类型的组合为key，以itab结构体指针为value，构造一个哈希表，由于存储与itab缓存信息，当需要一个itab时，会首先去这里查找，可以的哈希值是这样计算的
+
+``` go
+func itabHashFunc(inter *interfacetype, typ *_type) uintptr {
+	return uintptr(inter.typ.hash ^ typ.hash)
+}
+```
+
+如果有对应的itab指针，就直接拿来使用，若itab缓存没有，就要创建一个itab结构体，然后添加到这个哈希表中
+
+# 类型断言
+### 空接口.(具体类型)
+
+``` go
+var e interface{}
+
+r, ok := e.(*os.File)
+```
+
+只需要判断这个_type是否指向*os.File的类型元数据就可以，golang中每种类型的类型元数据都是全局唯一的
+
+``` go
+var e interface{}
+
+f := "eintr"
+
+e = f
+
+r, ok := e.(*os,File) // r == nil ok == false
+```
+
+### 非空接口.(具体类型)
+
+``` go
+var rw io.ReadWriter
+
+r, ok := rw.(*os.File)
+```
+
+判断rw的动态类型是否为*os.File，前面介绍过，程序中用到的itab结构体都会缓存起来，可以通过接口类型和动态类型组合起来的key，查找到对应的itab指针，所以这里的类型断言只要一次比较就能完成
+![](./类型断言——非空接口.具体类型.png )
+### 空接口.(非空接口)
+
+``` go
+var e interface{}
+
+f, _ := os.Open("./main.go")
+e = f
+rw, ok := e.(io.ReadWriter)
+```
+
+虽然*os.File后面可以找到类型关联的方法元数据数组，也不必每次都去检查是否有对应接口要求的所有方法，可以先到itab缓存中查找一下，若没有io.ReadWriter和*os.File对应的itab结构体，再去检查*os.File的方法列表
+值得强调的是，就算能从缓存中查找到对应的itab，也要进一步判断itab.fun[0]是否等于0，这是因为断言失败的类型组合，其对应的itab结构体也会被缓存起来，只是会把itab.func[0]置为0，用来表示这里的动态类型并没有实现对应的接口，这样再碰到同种的类型断言时，就不用再检查方法列表了，可以直接断言失败
+
+### 非空接口.(非空接口)
+
+``` go
+var w io.Writer
+
+rw, ok := w.(io.ReadWriter) // 是判断w存储的动态类型 是否实现了io.ReadWriter接口
+```
+
+![](./非空接口断言非空接口.png )
+
+``` go
+func main() {
+	var i interface{}
+	e := new(eintr)
+	i = *e
+	_, ok := i.(io.ReadWriter)
+	fmt.Println(ok)
+}
+
+type eintr struct {
+	name string
+}
+
+func (e *eintr) Write(b []byte) (n int, err error) {
+	return len(e.name), nil
+}
+
+```
+
+# 反射
+反射的作用就是把类型元数据暴露给用户使用，只不过由于类型结构都是未导出的，所以reflect包中又定义了一套，这些类型定义在两个包中是保持一致的
+
+> TypeOf
+
+``` go
+func TypeOf(i interface{}) Type {
+	eface := *(*emptyInterface) (unsafe.Pointer(&i))
+	return toType(eface.typ)
+}
+```
+这个函数用于获取一个变量的类型信息
+
+
+``` go
+type Type interface {
+  Align() int // 对齐边界
+  FieldAlign() int
+  Method(int) Method // 方法
+  MethodByName(string) (Method, biil)
+  NumMethod() int
+  Name() string // 类型名称
+  PkgPath() uintptr // 包路径
+  String() string
+  Kind() Kind
+  Implements(u Type) bool // 是否实现指定接口
+  AssignableTo(u Type) bool
+  Convertibale(u Type) bool
+  Comparable() bool // 是否可以比较
+  ...
+}
+```
+
+``` go
+type Eintr struct {
+	Name string
+}
+
+func (e Eintr) A() {
+
+}
+
+func (e Eintr) B() {
+
+}
+
+func main() {
+	a := Eintr{Name: "eintr"}
+	t := reflect.TypeOf(a)
+	fmt.Println(t.Name(), t.NumMethod())
+}
+
+```
+
+从函数调用栈来看
+- 局部变量
+  - a(Eintr)
+  - t (reflect.Type)
+- 返回值
+- 参数
+**go中传参值拷贝，参数空间这里本应该拷贝a的值过来，但是这里的参数是一个interface{}，需要的是一个地址，所以编译器会构造一个临时变量传递作为a的拷贝，然后在参数空间这里使用这个临时变量的地址，现在TypeOf使用的就是a的拷贝，这样既符合传参值拷贝的语义，有满足了空接口类型的参数只能接受地址的需求**
+
+
 # GPM
+## GPM的基本知识
+一个helloworld程序，编译后成为一个可执行文件，执行时可执行文件被加载到内存，对于进程虚拟空间中的代码段，我们感兴趣的是程序的执行入口，它并不是我们熟悉的main.main，不同平台下程序执行入口不同，在一系列初始化和准备工作后，会以`runtime.main`为执行入口，创建main goroutine，main goroutine执行起来以后才会调用我们编写的main.main
+再来看数据段，这里有几个重要的全局变量不得不提
+- runtime.g goroutine
+- runtime.m 工作线程
+- g0 主线程对应的g，与其他协程有所不同，它的协程栈实际上是在主线程栈上分配的 g0持有m0的指针
+- m0 主线程对应的m m0也持有g0的指针 而且一开始m0上执行的协程正是g0
+- allgs 记录所有的g
+- allm 记录所有的m
+
+最初golang的调度模型中只有M和G，所以待执行的G排排坐 等在一处，每个M来获取一个G时都要加锁，多个M分担这多个G的执行任务，就会因为频繁加锁解锁而发生等待，影响程序并发性能，所以后来在M和G以外又引入了`P`
+
+`P`对应的数据结构是`runtime.p`,它有一个本地runq，这样只要把一个P关联到一个M，这个M就可以从P这里直接获取待执行的G，不用每次都和众多M从一个`全局队列`中争抢任务了，也就是说虽然P有一个本地runq，但是依然有一个全局runq，保存在全局变量sched中，这个变量代表的是调度器
+调度器对应的数据结构是`runtime.schedt`，这里记录着所有空闲的m、空闲的p等等，其中就有一个全局的runq
+如果本地的runq已满，那么等待的G就会被放到这个全局队列中，而M会先从关联的P持有的本地runq中获取待执行的G，没有的话再到调度器持有的全局队列这里领取一些任务，如果全局队列也没有了，就会去别的P那里分担一些G过来
+同G和M一样，也有一个全局变量用来保存所有的P，在程序初始化过程中会进行调度器初始化，这时会按照`GOMAXPROCS`这个环境变量，决定创建多少个P，保存在全局变量`allp`中，并且把第一个P(allp[0])与m0关联起来
+简单来说G M P 之间就是这样的合作关系
+
+在main goroutine创建之前，G P M之间的情况如下
+main goroutine创建之后，被加入到当前P的本地队列中，然后通过mstart函数开启调度循环，这个mstart函数，是所有工作线程的入口，主要就是调用schedule函数，也就是执行调度循环，其实对于一个活跃的m而言，不是在执行G，就是在执行调度程序获取某个G
+这里的例子中 队列里只有main goroutine等待执行，所以m0切换到main goroutine，执行入口自然是runtime.main，他会做许多事情，包括创建监控线程，进行包初始化等等，其中就包括调用main.main，在main.main返回后，runtime.main会调用exit()函数结束进程
+
+``` go
+func hello() {
+	println("Hello Wolrd")
+}
+
+func main() {
+	go hello() // 不会执行
+}
+
+```
+
+我们通过`go`关键字创建协程，会被编译器转换为`newproc`函数调用，main goroutine也是由 newproc 函数创建的，创建goroutine时我们只负责指定入口、参数，而 newproc 会给goroutine构造一个栈帧，目的是让协程任务结束后，返回到goexit函数中，进行协程资源回收等工作
+
+
+``` go
+func hello() {
+	println("Hello Wolrd")
+}
+
+func main() {
+	go hello() // 会执行
+	time.Sleep(time.Second)
+}
+```
+
+Sleep实际上会调用`gopark`函数，把当前协程从_Grunning修改为_Gwaiting，然后main goroutine不会回到当前P的runq中，而是在timer中等待，继而调用schedule() 进行调度，hello goroutine得以执行，等到sleep的时间到达后，timer会吧main goroutine重新置为_Grunnable状态，放回到G的runq中，在之后main.main结束，runtime.main调用exit,进程结束
+
+
+## goroutine的创建、让出和恢复
+
+
+``` go
+func hello(name string) {
+	println("Hello", name)
+	ch <- struct{}{}
+}
+
+var ch = make(chan struct{})
+
+func main() {
+	name := "eintr"
+	go hello(name)
+	<-ch
+}
+
+```
+
+
+观察函数栈帧
+
+``` go
+func newproc(siz int32, fn *funcval) // 传递给协程入口函数的参数占多少字节 协程入口函数对应的funcval指针
+
+- BP of main
+- 局部变量
+  - name
+- 参数空间
+  - name // copy of name
+  - fn = &hello funcval
+  - siz = 16
+- SP of main
+- BP of newproc
+
+```
+
+
 
 # GC
 
