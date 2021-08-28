@@ -440,6 +440,31 @@ go通过一个`function value`调用函数时，会把对应的`funcval`结构�
 
 # 方法
 
+**方法本质上就是函数，只不过调用时，接收者会作为第一个参数传入**
+
+``` go
+// built-in 内置类型
+int8
+int16
+int32
+int64
+int
+byte
+string
+slice
+func
+map
+
+// 自定义
+type T int
+type T struct {
+	name string
+}
+type I interface {
+	Name() string
+}
+```
+
 ``` go
 type A struct {
 	name string
@@ -955,7 +980,7 @@ func main() {
 	A()
 }
 
-// runtime.g_
+// runtime.g_如身体
              \_defer_ -> A2 -> A1
              \_panic_ panicA
 func A() {
